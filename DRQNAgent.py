@@ -1,0 +1,935 @@
+import sys
+import os
+import copy
+import numpy as np
+import collections
+np.random.seed(0)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+
+from Logger import Logger
+from User import User
+from Handover import Handover, RATE_UPPER
+from Topology import Topology
+from Network import Network
+
+log = Logger('./log/RL/DRQN.log',level='debug',w_level='info')
+per_ep_log = open('./log/RL/DRQN_per_ep.csv', 'w')
+per_ep_log.write('episode,reward,rate_avg,hops_avg,ho_avg,q_spread,uniq_sat,beam_avg,rew_rate,rew_ho,loss,q_gap_avg,q_gap_noise,n_valid\n')
+
+
+def resolve_device(device='auto'):
+    if device == 'auto':
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(device)
+
+class UserReplayer:
+    def __init__(self, capacity, sequence):
+        self.capacity = capacity
+        self.sequence = sequence
+        self.memory = collections.deque(maxlen=self.capacity)
+
+    def put(self, transition):
+        self.memory.append(transition)
+
+    def reset(self):
+        self.memory.clear()
+
+class CenterReplayer:
+    def __init__(self, capacity, sequence):
+        self.capacity = capacity
+        self.sequence = sequence
+        self.memory = {}
+        self.priorities = {}
+        self.alpha = 0.6
+        self.eps = 1e-6
+
+    def init_memory(self, agents):
+        for agent in agents:
+            self.memory[agent] = collections.deque(maxlen=self.capacity)
+            self.priorities[agent] = collections.deque(maxlen=self.capacity)
+
+    def put(self, agent, head_idx, transition):
+        self.memory[agent].append(transition + [head_idx])
+        max_p = max((max(p) if len(p)>0 else 1.0) for p in self.priorities.values()) if any(len(p)>0 for p in self.priorities.values()) else 1.0
+        self.priorities[agent].append(max_p)
+
+    def reset(self,agents):
+        self.agents = agents
+        self.memory.clear()
+        self.priorities.clear()
+        self.init_memory(self.agents)
+
+    def sample(self, size):
+        states, actions, rewards, next_states, next_actions, head_ids = [], [], [], [], [], []
+        # 用所有agent中最小的buffer长度, 避免越界
+        min_len = min(len(self.memory[a]) for a in self.agents)
+        length = min_len - self.sequence + 1
+        if length <= 0: return [],[],[],[],[],[]
+
+        all_p = []
+        for ai, a in enumerate(self.agents):
+            pl = list(self.priorities[a])[:length]
+            all_p.extend((p + self.eps) ** self.alpha for p in pl)
+        total = sum(all_p)
+        probs = [p/(total if total>0 else 1.0) for p in all_p]
+        indices = np.random.choice(len(self.agents)*length, size=size, p=probs)
+        for i in indices:
+            agent_index = int(i/length)
+            sample_index = int(i%length)
+            temp_states = []
+            temp_actions = []
+            temp_rewards = []
+            temp_next_states = []
+            temp_next_actions = []
+            for j in range(self.sequence):
+                temp_states.append(self.memory[self.agents[agent_index]][sample_index+j][0])
+                temp_actions.append(self.memory[self.agents[agent_index]][sample_index+j][1])
+                temp_rewards.append(self.memory[self.agents[agent_index]][sample_index+j][2])
+                temp_next_states.append(self.memory[self.agents[agent_index]][sample_index+j][3])
+                temp_next_actions.append(self.memory[self.agents[agent_index]][sample_index+j][4])  # SARSA
+            head_id = self.memory[self.agents[agent_index]][sample_index][5]  # head_idx
+            states.append(temp_states)
+            actions.append(temp_actions)
+            rewards.append(temp_rewards)
+            next_states.append(temp_next_states)
+            next_actions.append(temp_next_actions)
+            head_ids.append(head_id)
+        return states, actions, rewards, next_states, next_actions, head_ids
+
+TOP_K = 12           # 输入top-K颗可见星 (LSTM固定模式)
+MAX_SATS = 30        # 变长模式: 最大可见星数
+FEAT_PER_SAT = int(os.environ.get('LEO_FEAT_PER_SAT', '4'))
+VARLEN = os.environ.get('LEO_VARLEN', '0') == '1'  # 变长输入模式
+
+class Q_net(nn.Module):
+    """Top-K per-sat scoring + Dueling:
+       LSTM处理top-K×3特征序列→ctx, 每星3特征→sat_net→16dim,
+       Dueling: V(s)从ctx算, A(s,a)从[sat_feat+ctx]算, Q=V+(A-mean(A)).
+       agent_embed: 每人64维身份向量, 独立ctx_fc/sat_net/v_head/a_head."""
+    def __init__(self, state_space, action_space, hidden_size, num_agents=200, embed_dim=64,
+                 top_k=TOP_K, feat_per_sat=FEAT_PER_SAT):
+        super(Q_net, self).__init__()
+
+        self.embed_dim = embed_dim
+        self.hidden_size = hidden_size
+        self.input_size = state_space  # top_k * feat_per_sat + embed_dim
+        self.output_size = action_space  # top_k
+        self.num_agents = num_agents
+        self.top_k = top_k
+        self.feat_per_sat = feat_per_sat
+
+        self.agent_embed = nn.Embedding(num_agents, embed_dim)
+        nn.init.uniform_(self.agent_embed.weight, -0.1, 0.1)
+
+        self.lstm = nn.LSTM(self.input_size, self.hidden_size, batch_first=True)
+        self.ctx_fcs = nn.ModuleList([nn.Linear(self.hidden_size, 16) for _ in range(num_agents)])
+        # sat_net: 每星3特征 → 16维
+        self.sat_nets = nn.ModuleList([
+            nn.Sequential(nn.Linear(feat_per_sat, 32), nn.ReLU(), nn.Linear(32, 16), nn.ReLU())
+            for _ in range(num_agents)
+        ])
+        self.v_heads = nn.ModuleList([nn.Linear(16, 1) for _ in range(num_agents)])
+        self.a_heads = nn.ModuleList([nn.Linear(16 + 16, 1) for _ in range(num_agents)])
+        self._head_idx = 0
+
+        for name, param in self.lstm.named_parameters():
+            if 'weight' in name: nn.init.orthogonal_(param, gain=1.0)
+            elif 'bias' in name: nn.init.constant_(param, 0.0)
+
+    def forward(self, input, h, c, head_indices=None):
+        B, seq_len = input.shape[0], input.shape[1]
+        K = self.top_k
+        F = self.feat_per_sat
+
+        if head_indices is not None:
+            embed = self.agent_embed(head_indices)
+        else:
+            embed = self.agent_embed(torch.tensor([self._head_idx], device=input.device)).expand(B, -1)
+        embed_seq = embed.unsqueeze(1).expand(-1, seq_len, -1)
+        input_with_embed = torch.cat([input, embed_seq], dim=-1)  # [B, seq, K*F+embed_dim]
+        x, (new_h, new_c) = self.lstm(input_with_embed, (h, c))  # [B, seq, hidden]
+
+        # 独立 ctx_fc
+        ctx = torch.zeros(B, seq_len, 16, device=input.device)
+        if head_indices is not None:
+            for idx in range(self.num_agents):
+                mask = (head_indices == idx)
+                if mask.any():
+                    ctx[mask] = torch.relu(self.ctx_fcs[idx](x[mask]))
+        else:
+            ctx = torch.relu(self.ctx_fcs[self._head_idx](x))
+
+        # Dueling: V(s) 从 ctx 算
+        V = torch.zeros(B, seq_len, 1, device=input.device)
+        if head_indices is not None:
+            for idx in range(self.num_agents):
+                mask = (head_indices == idx)
+                if mask.any():
+                    V[mask] = self.v_heads[idx](ctx[mask])
+        else:
+            V = self.v_heads[self._head_idx](ctx)
+
+        ctx_exp = ctx.unsqueeze(2).expand(-1, -1, K, -1)  # [B, seq, K, 16]
+
+        # per-sat: K颗星 × F特征 → sat_net → [K, 16]
+        per_sat = input[:, :, :K*F].reshape(B, seq_len, K, F)  # [B, seq, K, F]
+        sat_feat = torch.zeros(B, seq_len, K, 16, device=input.device)
+        if head_indices is not None:
+            for idx in range(self.num_agents):
+                mask = (head_indices == idx)
+                if mask.any():
+                    agent_sats = per_sat[mask]  # [n, seq, K, F]
+                    ns, sq = agent_sats.shape[0], agent_sats.shape[1]
+                    out = self.sat_nets[idx](agent_sats.reshape(ns * sq * K, F))
+                    sat_feat[mask] = out.reshape(ns, sq, K, 16)
+        else:
+            flat = per_sat.reshape(B * seq_len * K, F)
+            sat_feat = self.sat_nets[self._head_idx](flat).reshape(B, seq_len, K, 16)
+
+        combined = torch.cat([sat_feat, ctx_exp], dim=-1)  # [B, seq, K, 32]
+
+        if head_indices is not None:
+            y = torch.zeros(B, seq_len, K, device=combined.device)
+            for idx in range(self.num_agents):
+                mask = (head_indices == idx)
+                if mask.any():
+                    A = self.a_heads[idx](combined[mask]).squeeze(-1)  # [n, seq, K]
+                    A_centered = A - A.mean(dim=-1, keepdim=True)
+                    y[mask] = A_centered + V[mask]
+        else:
+            A = self.a_heads[self._head_idx](combined).squeeze(-1)
+            A_centered = A - A.mean(dim=-1, keepdim=True)
+            y = A_centered + V
+
+        y = torch.clamp(y, -20, 20)
+        return y, new_h, new_c
+
+    def init_hidden_state(self, batch_size, train=None):
+        if train is True:
+            return torch.zeros([1, batch_size, self.hidden_size]), torch.zeros([1, batch_size, self.hidden_size])
+        else:
+            return torch.zeros([1, 1, self.hidden_size]), torch.zeros([1, 1, self.hidden_size])
+
+    def init_hidden_state(self, batch_size, train=None):
+        if train is True:
+            return torch.zeros([1, batch_size, self.hidden_size]), torch.zeros([1, batch_size, self.hidden_size])
+        else:
+            return torch.zeros([1, 1, self.hidden_size]), torch.zeros([1, 1, self.hidden_size])
+
+
+# ── Transformer wrapper: 适配 Q_net 接口 ──
+def _run_agentwise(module_list, x, head_indices, reshape_fn=None):
+    """对每个 agent 独立运行 module_list[idx], 返回拼接结果."""
+    B = x.shape[0]
+    y = torch.zeros(B, *x.shape[1:], device=x.device) if reshape_fn is None else None
+    for idx in range(len(module_list)):
+        mask = (head_indices == idx)
+        if mask.any():
+            out = module_list[idx](x[mask])
+            if reshape_fn is not None:
+                out = reshape_fn(out, mask)
+    return y
+
+
+class TransformerQ_net(nn.Module):
+    """Transformer 替代 LSTM: 每颗卫星=1个token, self-attention跨卫星建模.
+       变长模式(LEO_VARLEN=1): 全部可见星, padding mask忽略无效位置."""
+    def __init__(self, state_space, action_space, hidden_size, num_agents=200, embed_dim=64,
+                 top_k=TOP_K, feat_per_sat=FEAT_PER_SAT, nhead=4, nlayers=3, max_seq=6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = state_space
+        self.output_size = action_space
+        self.num_agents = num_agents
+        self.top_k = top_k
+        self.feat_per_sat = feat_per_sat
+        self.embed_dim = embed_dim
+        self.varlen = VARLEN
+
+        # Agent embedding
+        self.agent_embed = nn.Embedding(num_agents, embed_dim)
+        nn.init.uniform_(self.agent_embed.weight, -0.1, 0.1)
+
+        # Per-sat投影: F → hidden (共享)
+        self.sat_proj = nn.Linear(feat_per_sat, hidden_size)
+        # Agent embedding投影: embed_dim → hidden
+        self.embed_proj = nn.Linear(embed_dim, hidden_size)
+
+        # 可学习卫星位置编码 [1, 1, K, hidden]
+        self.sat_pos = nn.Parameter(torch.randn(1, 1, top_k, hidden_size) * 0.02)
+
+        # Transformer: 自注意力跨卫星
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=nhead, dim_feedforward=hidden_size * 4,
+            dropout=0.05, activation='relu', batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
+
+        # Per-agent heads
+        self.ctx_fcs = nn.ModuleList([nn.Linear(hidden_size, 16) for _ in range(num_agents)])
+        # Per-sat特征提取: raw F→16 (保留每星差异) + cross-sat attention输出H→16 (跨星上下文)
+        self.sat_nets = nn.ModuleList([
+            nn.Sequential(nn.Linear(feat_per_sat, 32), nn.ReLU(), nn.Linear(32, 16), nn.ReLU())
+            for _ in range(num_agents)
+        ])
+        self.cross_heads = nn.ModuleList([nn.Linear(hidden_size, 16) for _ in range(num_agents)])
+        self.v_heads = nn.ModuleList([nn.Linear(16, 1) for _ in range(num_agents)])
+        self.a_heads = nn.ModuleList([nn.Linear(16 + 16, 1) for _ in range(num_agents)])
+        self._head_idx = 0
+
+    def _sat_mask(self, sat_tokens):
+        """卫星token mask: 全零特征 → padding."""
+        return (sat_tokens.abs().sum(dim=-1) < 1e-8)  # [B, seq, K], True=无效
+
+    def forward(self, input, h, c, head_indices=None):
+        B, seq_len, _ = input.shape
+        F = self.feat_per_sat
+        H = self.hidden_size
+        # 变长模式: 从实际输入推导K (input=[B,seq,K*F], embed由网络生成)
+        if self.varlen:
+            K = input.shape[2] // F
+        else:
+            K = self.top_k
+
+        # Agent embedding
+        if head_indices is not None:
+            embed = self.agent_embed(head_indices)  # [B, embed_dim]
+        else:
+            embed = self.agent_embed(
+                torch.tensor([self._head_idx], device=input.device)).expand(B, -1)
+
+        # 卫星token化: [B, seq, K*F] → [B*seq, K, F]
+        sat_flat = input[:, :, :K * F]
+        sat_tokens = sat_flat.view(B, seq_len, K, F)
+
+        # Padding mask
+        pad_mask_3d = self._sat_mask(sat_tokens)  # [B, seq, K]
+        pad_mask = pad_mask_3d.view(B * seq_len, K)  # [B*seq, K]
+
+        # Per-sat投影: F→hidden
+        sat_h = self.sat_proj(sat_tokens)  # [B, seq, K, H]
+
+        # Agent embedding加到每个卫星token
+        embed_h = self.embed_proj(embed).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, H]
+        sat_h = sat_h + embed_h
+
+        # 卫星位置编码 (变长时取前K个位置)
+        sat_h = sat_h + self.sat_pos[:, :, :K, :]
+
+        # Flatten: [B*seq, K, H] → Transformer跨卫星attention
+        tokens = sat_h.view(B * seq_len, K, H)
+        out = self.transformer(tokens, src_key_padding_mask=pad_mask)  # [B*seq, K, H]
+        out = out.view(B, seq_len, K, H)
+
+        # Context: mean-pool有效卫星的Transformer输出
+        valid = (~pad_mask_3d).float().unsqueeze(-1)  # [B, seq, K, 1]
+        ctx_h = (out * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)  # [B, seq, H]
+
+        # Per-agent ctx + per-sat features
+        ctx = torch.zeros(B, seq_len, 16, device=input.device)
+        if head_indices is not None:
+            for idx in range(self.num_agents):
+                m = (head_indices == idx)
+                if m.any():
+                    ctx[m] = torch.relu(self.ctx_fcs[idx](ctx_h[m]))
+        else:
+            ctx = torch.relu(self.ctx_fcs[self._head_idx](ctx_h))
+
+        # Per-sat features: raw F→16 (sat_nets) + cross-sat attention H→16 (cross_heads)
+        # 修复: 之前sat_nets只吃raw特征, Transformer的跨星attention被mean-pool碾平浪费了
+        sat_feat = torch.zeros(B, seq_len, K, 16, device=input.device)
+        if head_indices is not None:
+            for idx in range(self.num_agents):
+                m = (head_indices == idx)
+                if m.any():
+                    ns, sq = sat_tokens[m].shape[0], sat_tokens[m].shape[1]
+                    raw_feat = self.sat_nets[idx](sat_tokens[m].reshape(ns * sq * K, F)).reshape(ns, sq, K, 16)
+                    cross_feat = self.cross_heads[idx](out[m])  # [n, seq, K, H] → [n, seq, K, 16]
+                    sat_feat[m] = raw_feat + cross_feat
+        else:
+            flat_raw = sat_tokens.reshape(B * seq_len * K, F)
+            raw_feat = self.sat_nets[self._head_idx](flat_raw).reshape(B, seq_len, K, 16)
+            cross_feat = self.cross_heads[self._head_idx](out)  # [B, seq, K, H] → [B, seq, K, 16]
+            sat_feat = raw_feat + cross_feat
+
+        # Dueling: V(ctx) + A(sat, ctx) → Q
+        V = torch.zeros(B, seq_len, 1, device=input.device)
+        if head_indices is not None:
+            for idx in range(self.num_agents):
+                m = (head_indices == idx)
+                if m.any():
+                    V[m] = self.v_heads[idx](ctx[m])
+        else:
+            V = self.v_heads[self._head_idx](ctx)
+
+        ctx_exp = ctx.unsqueeze(2).expand(-1, -1, K, -1)
+        combined = torch.cat([sat_feat, ctx_exp], dim=-1)
+
+        if head_indices is not None:
+            y = torch.zeros(B, seq_len, K, device=combined.device)
+            for idx in range(self.num_agents):
+                m = (head_indices == idx)
+                if m.any():
+                    A = self.a_heads[idx](combined[m]).squeeze(-1)
+                    A_centered = A - A.mean(dim=-1, keepdim=True)
+                    y[m] = A_centered + V[m]
+        else:
+            A = self.a_heads[self._head_idx](combined).squeeze(-1)
+            A_centered = A - A.mean(dim=-1, keepdim=True)
+            y = A_centered + V
+
+        # Mask无效卫星
+        if self.varlen:
+            y = y.masked_fill(pad_mask_3d, -float('inf'))
+
+        return y, h, c  # h,c 不变 (Transformer 无 hidden state)
+
+    def init_hidden_state(self, batch_size, train=None):
+        return None, None  # Transformer 无需 LSTM hidden state
+
+
+class UserAgent:
+    def __init__(self, user:User, env:Handover, c_agent, gamma=0.9, epsilon=0.01, batch=256, buffer=2000, hidden_size=128, seq=6, device='auto', head_idx=0):
+        self.use_transformer = os.environ.get('LEO_USE_TRANSFORMER', '0') == '1'
+        K = MAX_SATS if (VARLEN and self.use_transformer) else TOP_K
+        self.action_n = K
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.batch_size = batch
+        self.sequence = seq
+        self.device = resolve_device(device)
+        self.replayer = UserReplayer(buffer,self.sequence)
+        self.head_idx = head_idx
+
+        state_dim = K * FEAT_PER_SAT
+        if self.use_transformer:
+            self.evaluate_net = TransformerQ_net(state_dim + 64, K, hidden_size, top_k=K).to(self.device)
+        else:
+            self.evaluate_net = Q_net(state_dim + 64, K, hidden_size, top_k=K).to(self.device)
+
+        self.user = user
+        self.c_agent = c_agent
+        self.env = env
+        self._last_q_spread = 0.0
+        self._last_q_gap = 0.0
+
+    def reset(self, mode=None):
+        self.mode = mode
+        self.state_fifo = collections.deque(maxlen=self.sequence)
+        self.lstm_h = None
+        self.lstm_c = None
+        if self.mode == 'train':
+            self.trajectory = collections.deque(maxlen=6)
+
+    def step(self,observation,reward, h, c):
+        # 获取可见卫星ID列表 (Observe存入user._topK_sat_ids)
+        K = self.action_n
+        sat_ids = getattr(self.user, '_topK_sat_ids', [0]*K)
+        n_valid = sum(1 for sid in sat_ids if sid > 0)  # 有效卫星数
+
+        # 最小保持时间: 如果当前星在top-K中, 保持其索引
+        MIN_HOLD_SLOTS = 2
+        last_ho = getattr(self.user, '_last_handover_time', None)
+        if (last_ho is not None
+            and self.user.sat_connected is not None
+            and self.user.sat_connected in self.user.sat_covered
+            and self.env.topo.current_time - last_ho < MIN_HOLD_SLOTS * 50):
+            cur_id = self.user.sat_connected.ID
+            if cur_id in sat_ids:
+                return sat_ids.index(cur_id)  # 返回top-K中的索引
+            return 0  # 安全fallback
+
+        # 论文: LSTM/Transformer 时序处理
+        if not self.use_transformer:
+            if self.lstm_h is None:
+                self.lstm_h = torch.zeros(1, 1, self.evaluate_net.hidden_size).to(self.device)
+                self.lstm_c = torch.zeros(1, 1, self.evaluate_net.hidden_size).to(self.device)
+
+        # 论文: 维护L个状态的FIFO, LSTM处理整个序列
+        self.state_fifo.append(observation)
+        if self.mode=='train' and np.random.rand()<self.epsilon:
+            action = np.random.randint(0, n_valid) if n_valid > 0 else 0
+        else:
+            if len(self.state_fifo) >= self.sequence:
+                seq = torch.as_tensor(list(self.state_fifo), dtype=torch.float).to(self.device).unsqueeze(0)
+            else:
+                pad = [observation] * (self.sequence - len(self.state_fifo))
+                seq_list = pad + list(self.state_fifo)
+                seq = torch.as_tensor(seq_list, dtype=torch.float).to(self.device).unsqueeze(0)
+            self.evaluate_net._head_idx = self.head_idx
+            if self.use_transformer and self.evaluate_net.varlen:
+                # 变长: 只喂实际可见星, 不浪费时间算padding
+                # seq = [B, seq, K*F], embed由网络内部从head_idx生成
+                seq_trim = seq[:, :, :n_valid * FEAT_PER_SAT]
+                q_tensor, _, _ = self.evaluate_net(seq_trim, None, None)
+            elif self.use_transformer:
+                q_tensor, _, _ = self.evaluate_net(seq, None, None)
+            else:
+                q_tensor, self.lstm_h, self.lstm_c = self.evaluate_net(seq, self.lstm_h, self.lstm_c)
+            q_tensor = q_tensor[:, -1, :].squeeze(0)  # [K]
+            # 屏蔽padding卫星 (变长模式已截断, 无需mask)
+            if not (self.use_transformer and self.evaluate_net.varlen):
+                for i in range(K):
+                    if i >= n_valid:
+                        q_tensor[i] = -float('inf')
+            action_tensor = torch.argmax(q_tensor)
+            action = action_tensor.item()
+            # Q值分散度
+            valid_q = q_tensor[q_tensor > -float('inf')]
+            self._last_q_spread = (valid_q.max() - valid_q.min()).item() if len(valid_q) > 1 else 0.0
+            self._last_q_gap = 0.0
+            if self.user.sat_connected is not None:
+                cur_id = self.user.sat_connected.ID
+                if cur_id in sat_ids:
+                    old_idx = sat_ids.index(cur_id)
+                    if old_idx != action and old_idx < n_valid:
+                        self._last_q_gap = (q_tensor[action] - q_tensor[old_idx]).item()
+
+        if self.mode=='train':
+            self.trajectory += [observation, reward, action]
+            if len(self.trajectory)==6:
+                state = self.trajectory[0]
+                act = self.trajectory[2]
+                next_state = self.trajectory[3]
+                reward = self.trajectory[4]
+                next_act = self.trajectory[5]  # SARSA: on-policy next action (0-5)
+                self.replayer.put([state,act,reward,next_state,next_act])
+                self.c_agent.replayer.put(self, self.head_idx, [state,act,reward,next_state,next_act])
+        return action
+    
+    def observe(self,mode:str):
+        observation = self.env.Observe(self.user,mode)
+        return observation
+    
+    def get_reward(self):
+        reward = self.env.Get_Reward(self.user)
+        return reward
+    
+
+class CenterAgent:
+    def __init__(self, env:Handover, gamma=0.9, epsilon=0.01, batch=256, buffer=5000, hidden_size=128, lr=0.001, seq=6, device='auto'):
+        use_tf = os.environ.get('LEO_USE_TRANSFORMER', '0') == '1'
+        K = MAX_SATS if (VARLEN and use_tf) else TOP_K
+        self.action_n = K
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.batch_size = batch
+        self.sequence = seq
+        self.device = resolve_device(device)
+        self.replayer = CenterReplayer(buffer,self.sequence)
+
+        state_dim = K * FEAT_PER_SAT
+        n_agents = len(env.topo.user)  # 支持不同用户数 (100-400)
+        if use_tf:
+            self.evaluate_net = TransformerQ_net(state_dim + 64, K, hidden_size, num_agents=n_agents, top_k=K).to(self.device)
+            print("  [CenterAgent] 使用 TransformerQ_net", flush=True)
+        else:
+            self.evaluate_net = Q_net(state_dim + 64, K, hidden_size, top_k=K).to(self.device)
+        self.optimizer = optim.Adam(self.evaluate_net.parameters(), lr=lr)
+        self.loss = nn.SmoothL1Loss()
+
+        self.env = env
+        self.learn_cnt = 0  # 梯度冲突诊断计数器
+
+    def reset(self,agents):
+        self.target_net = copy.deepcopy(self.evaluate_net).to(self.device)
+        self.replayer.reset(agents)
+
+    def learn(self):
+        # replay
+        states, actions, rewards, next_states, next_actions, head_indices = self.replayer.sample(self.batch_size)
+        if not states: return
+        state_tensor = torch.as_tensor(states, dtype=torch.float).to(self.device)
+        action_tensor = torch.as_tensor(actions, dtype=torch.long).to(self.device)
+        reward_tensor = torch.as_tensor(rewards, dtype=torch.float).to(self.device)
+        next_state_tensor = torch.as_tensor(next_states, dtype=torch.float).to(self.device)
+        next_action_tensor = torch.as_tensor(next_actions, dtype=torch.long).to(self.device)  # SARSA
+        head_idx_tensor = torch.as_tensor(head_indices, dtype=torch.long).to(self.device)
+
+        # NaN检测: 输入数据
+        if torch.isnan(state_tensor).any() or torch.isinf(state_tensor).any():
+            raise RuntimeError("NaN/Inf in replay states!")
+        if torch.isnan(reward_tensor).any() or torch.isinf(reward_tensor).any():
+            raise RuntimeError("NaN/Inf in replay rewards!")
+
+        # SARSA target: r + γ × Q(s', a')
+        h_target, c_target = self.target_net.init_hidden_state(batch_size=self.batch_size, train=True)
+        h_target = h_target.to(self.device) if h_target is not None else None
+        c_target = c_target.to(self.device) if c_target is not None else None
+        next_q_tensor, _, _= self.target_net(next_state_tensor, h_target, c_target, head_idx_tensor)
+        # 直接取实际next_action的Q值 (a'永远合法, 无需mask)
+        next_sarsa_q = next_q_tensor.gather(2, next_action_tensor.unsqueeze(2)).squeeze(2)  # [B, seq]
+        target_tensor = reward_tensor + self.gamma * next_sarsa_q
+
+        h,c=self.evaluate_net.init_hidden_state(batch_size=self.batch_size, train=True)
+        h = h.to(self.device) if h is not None else None
+        c = c.to(self.device) if c is not None else None
+        pred_tensor, _, _ = self.evaluate_net(state_tensor, h, c, head_idx_tensor)
+        q_tensor = pred_tensor.gather( 2, action_tensor.unsqueeze(2)).squeeze(2)
+        loss_tensor = self.loss(target_tensor, q_tensor)
+
+        # NaN检测: loss
+        if torch.isnan(loss_tensor).any() or torch.isinf(loss_tensor).any():
+            raise RuntimeError(f"NaN/Inf in loss! target_range=[{target_tensor.min():.2f},{target_tensor.max():.2f}] q_range=[{q_tensor.min():.2f},{q_tensor.max():.2f}]")
+
+        # === 正交正则: embedding去相关, 减少多agent梯度冲突 ===
+        orth_lambda = float(os.environ.get('LEO_ORTH_LAMBDA', '0.01'))
+        if orth_lambda > 0:
+            E = self.evaluate_net.agent_embed.weight  # [num_agents, embed_dim]
+            E_norm = F.normalize(E, dim=1)
+            gram = E_norm @ E_norm.T
+            eye = torch.eye(self.evaluate_net.num_agents, device=E.device)
+            loss_orth = orth_lambda * ((gram - eye) ** 2).mean()
+            loss_tensor = loss_tensor + loss_orth
+        # ============================================================
+
+        # === 梯度冲突诊断: 由LEO_GRAD_DIAG控制间隔, 默认0(关闭), CPU训练建议关 ===
+        self.learn_cnt += 1
+        grad_diag_interval = int(os.environ.get('LEO_GRAD_DIAG', '0'))
+        if grad_diag_interval > 0 and self.learn_cnt % grad_diag_interval == 0:
+            self._diagnose_grad_conflict(state_tensor, action_tensor, reward_tensor,
+                                         next_state_tensor, next_action_tensor, head_idx_tensor)
+        # ================================================================
+
+        self.optimizer.zero_grad()
+        loss_tensor.backward()
+        torch.nn.utils.clip_grad_norm_(self.evaluate_net.parameters(), max_norm=10.0)
+        self.optimizer.step()
+        self.last_loss = loss_tensor.item()
+
+    def _diagnose_grad_conflict(self, state_tensor, action_tensor, reward_tensor,
+                                 next_state_tensor, next_action_tensor, head_idx_tensor):
+        """诊断: 每10次learn测量不同agent在共享参数上的梯度余弦相似度。
+
+        共享参数 = lstm + agent_embed (ctx_fcs/sat_nets/q_heads已独立)。
+        如果不同agent的梯度方向相反(cos<0), 共享参数被拉扯→需进一步去耦合。
+        """
+        import torch.nn.functional as F
+
+        K = 5
+        device = self.device
+
+        # 找样本数最多的K个agent (≥4条才有效)
+        agent_counts = torch.bincount(head_idx_tensor,
+                                      minlength=self.evaluate_net.num_agents)
+        top_agents = [idx.item() for idx in agent_counts.argsort(descending=True)
+                      if agent_counts[idx] >= 4][:K]
+
+        if len(top_agents) < 2:
+            print("[grad_conflict] 样本不足,跳过", flush=True)
+            return
+
+        # 共享参数名列表 — ctx_fcs/sat_nets/q_heads已独立, 只测lstm+agent_embed
+        shared_names = []
+        for n, p in self.evaluate_net.named_parameters():
+            if 'lstm' in n or ('agent_embed' in n and 'weight' in n):
+                shared_names.append(n)
+
+        per_agent_grads = []  # list of flat tensors
+        for agent_idx in top_agents:
+            mask = (head_idx_tensor == agent_idx)
+            n_samp = mask.sum().item()
+
+            s  = state_tensor[mask]
+            a  = action_tensor[mask]
+            r  = reward_tensor[mask]
+            ns = next_state_tensor[mask]
+            na = next_action_tensor[mask]
+            hi = head_idx_tensor[mask]
+
+            # Forward: evaluate_net
+            h_e, c_e = self.evaluate_net.init_hidden_state(n_samp, train=True)
+            pred, _, _ = self.evaluate_net(s, h_e.to(device), c_e.to(device), hi)
+            q_val = pred.gather(2, a.unsqueeze(2)).squeeze(2)
+
+            # Target: SARSA (target_net, no grad)
+            h_t, c_t = self.target_net.init_hidden_state(n_samp, train=True)
+            with torch.no_grad():
+                next_q, _, _ = self.target_net(ns, h_t.to(device), c_t.to(device), hi)
+                next_q_val = next_q.gather(2, na.unsqueeze(2)).squeeze(2)
+                target = r + self.gamma * next_q_val
+
+            loss = self.loss(q_val, target)
+
+            # Backward — 只看共享参数梯度
+            self.evaluate_net.zero_grad()
+            loss.backward()
+
+            grads = []
+            for nm, p in self.evaluate_net.named_parameters():
+                if nm in shared_names and p.grad is not None:
+                    grads.append(p.grad.detach().flatten())
+
+            if grads:
+                per_agent_grads.append(torch.cat(grads))
+
+        # 清理, 避免污染训练step
+        self.evaluate_net.zero_grad()
+
+        if len(per_agent_grads) < 2:
+            return
+
+        # Pairwise cosine similarity
+        K_actual = len(per_agent_grads)
+        cos_vals = []
+        for i in range(K_actual):
+            for j in range(i + 1, K_actual):
+                cos_vals.append(F.cosine_similarity(
+                    per_agent_grads[i].unsqueeze(0),
+                    per_agent_grads[j].unsqueeze(0)
+                ).item())
+
+        mean_cos = sum(cos_vals) / len(cos_vals)
+        min_cos = min(cos_vals)
+        conflict_ratio = sum(1 for v in cos_vals if v < 0) / len(cos_vals)
+
+        # 判断
+        if conflict_ratio > 0.3:
+            verdict = "⚠️ 冲突>30% → 需agent去耦合(独立hidden层/hypernetwork)"
+        elif mean_cos < 0.3:
+            verdict = "⚡ 方向弱相关 → 建议加大embedding或正交正则"
+        else:
+            verdict = "✓ 梯度方向一致 → 不需独立网络"
+
+        print(f"[grad_conflict] agents={top_agents} | "
+              f"mean_cos={mean_cos:.3f} min_cos={min_cos:.3f} "
+              f"conflict={conflict_ratio:.2f} | {verdict}",
+              flush=True)
+
+    def save_net(self, PATH):
+        torch.save(self.evaluate_net, PATH)
+
+def train_episode(env:Handover, u_agents, c_agent, model, mode=None,start_time=0, end_time=250000, time_step=50, net_step=20,batch=256, patience=5, min_episodes=2000, conv_threshold=0.005):
+    """训练一个DRQN episode序列，支持早停。
+
+    Args:
+        patience: 连续N个统计窗口无改善即早停 (每个窗口=400 episodes)
+        min_episodes: 早停前最少训练的episode数
+        conv_threshold: 判定改善的最小reward提升阈值
+    """
+    writer = SummaryWriter(f'./log/tensorboard/{model}')
+    total_reward = 0.0  #训练阶段总回报
+    reward_list = []
+    time = start_time   #当前训练时刻
+    episode = 0            #训练次数
+    actions = {}        #每个时隙内的agent动作集
+    env.reset(time,'NETWORK_LOAD')  #
+    c_agent.reset(u_agents)
+    temp_reward = 0     #用于计算某段时间内的平均
+    ob_re = {}  #{agent:[observation,reward]}
+
+    # Early stopping state
+    best_avg_reward = -float('inf')
+    no_improve_windows = 0
+    converged = False
+    stats_windows = 0  # 统计窗口计数
+
+    # buffer预热: 前N个ep只填buffer不训练, 确保初始Q网络用多样化经验
+    warmup_episodes = int(os.environ.get('LEO_WARMUP_EP', '20'))  # 前20ep ε=1纯探索填buffer
+
+
+    #用户agent初始化
+    for agent in u_agents:
+        agent.reset(mode=mode)
+        ob_re[agent] = [agent.observe('NETWORK_LOAD'),0.0]
+    # ISL故障模型 (环境变量控制)
+    ISL_FAIL_MODE = os.environ.get('LEO_ISL_FAIL_MODE', '0')  # '0'=关 '1'=Weibull 'random'=随机5%
+    if ISL_FAIL_MODE == '1':
+        env.net.init_isl_weibull()
+
+    while(time<=end_time):
+        episode_reward = 0.0
+
+        # ISL故障
+        if ISL_FAIL_MODE == '1':
+            env.net.apply_isl_failures(time)
+        elif ISL_FAIL_MODE == 'random':
+            import random as _random
+            # 首次缓存活跃LSA列表
+            if not hasattr(env.net, '_active_lsa_cache'):
+                env.net._active_lsa_cache = []
+                for ci in range(len(env.net.LSDB)):
+                    for si in range(len(env.net.LSDB[ci])):
+                        for lsa in env.net.LSDB[ci][si]:
+                            if lsa.isEstablished and lsa.total_band > 0:
+                                env.net._active_lsa_cache.append((ci, si, lsa))
+                env.net._failed_lsa = []
+            active = env.net._active_lsa_cache
+            failed = env.net._failed_lsa
+            _random.shuffle(active)
+            n_total = len(active) + len(failed)
+            n_change = max(1, int(n_total * 0.05))  # 同基数: 断和恢复都对总LSA的5%
+            # 恢复: 最多恢复n_change条
+            _random.shuffle(failed)
+            n_rec = min(n_change, len(failed))
+            for ci, si, lsa in failed[:n_rec]:
+                lsa.total_band = lsa._orig; lsa.isEstablished = True
+                active.append((ci, si, lsa))
+            env.net._failed_lsa = failed[n_rec:]
+            # 新断链: 最多断n_change条
+            n_fail = min(n_change, len(active))
+            for ci, si, lsa in active[:n_fail]:
+                if lsa.total_band > 0:
+                    if not hasattr(lsa, '_orig'): lsa._orig = lsa.total_band
+                    lsa.total_band = 0; lsa.isEstablished = False
+                    env.net._failed_lsa.append((ci, si, lsa))
+            env.net._active_lsa_cache = active[n_fail:]
+            env.net.Update_N2N_Load_By_LSDB_All()
+
+        # 终端action决策 + 即时统计合并 (reward仍放第二轮, 避免ISL free_band时序偏差)
+        # 论文MMF: impact在apply_mmf后统一计算
+        ep_rate = 0.0; ep_hops = 0.0; ep_ho = 0.0; n_conn = 0
+        for agent in u_agents:
+            ob_re[agent][0] = agent.observe('NETWORK_LOAD')
+            # warmup期间强制随机探索(ε=1)填满buffer
+            if episode < warmup_episodes:
+                agent.epsilon = 1.0
+            action_idx = agent.step(ob_re[agent][0],ob_re[agent][1],None,None)
+            episode_reward += ob_re[agent][1]
+            # 动作映射: 可见星索引 → 实际卫星ID
+            K = agent.action_n
+            sat_ids = getattr(agent.user, '_topK_sat_ids', [0]*K)
+            sat_id  = sat_ids[action_idx] if action_idx < len(sat_ids) else sat_ids[0]
+            # 论文公式3-23: 此用户切换对其他人的影响
+            bw_before = sum(sum(u.allocate_band.values()) for u in env.topo.user if u != agent.user)
+            single_action = {agent.user: sat_id}
+            if episode == 0:
+                env.step(single_action, 'INITIAL')
+            else:
+                env.step(single_action, 'NETWORK')
+            bw_after = sum(sum(u.allocate_band.values()) for u in env.topo.user if u != agent.user)
+            agent._impact = (bw_after - bw_before) / RATE_UPPER
+
+            # ── 即时统计 (ep_rate/hops/ho, 仅诊断用, 不影响训练) ──
+            u = agent.user
+            if u.sat_connected is not None and u.sat_connected in env.ho[u]:
+                access = min(env.ho[u][u.sat_connected].c_quality, RATE_UPPER)
+                fd = env._get_feeder_sat(u, u.sat_connected)
+                isl_b = env.net.N2N_status[u.sat_connected.con_id-1][u.sat_connected.ID-1][fd.ID-1].free_band if fd and u.sat_connected!=fd else RATE_UPPER
+                r = min(access, isl_b, RATE_UPPER)
+                h = 1.0
+                if fd and u.sat_connected != fd:
+                    h = max(1.0, env.Calc_Path_Hops(u.sat_connected, fd))
+                ep_rate += r; ep_hops += h
+                ep_ho += 1.0 if u.sat_connected != u.last_connected else 0.0
+                n_conn += 1
+        total_reward += episode_reward
+        temp_reward += episode_reward
+
+        # buffer预热: warmup期间只填buffer不训练
+        learn_interval = int(os.environ.get('LEO_LEARN_INTERVAL', '1'))
+        if episode >= warmup_episodes and episode % learn_interval == 0 and (all(len(a.replayer.memory) >= c_agent.sequence + 1 for a in u_agents)):
+            c_agent.learn()
+            if(episode%net_step==0):
+                c_agent.target_net = copy.deepcopy(c_agent.evaluate_net).to(c_agent.device)
+                shared_net = copy.deepcopy(c_agent.evaluate_net).to(c_agent.device)
+                for agent in u_agents:
+                    agent.evaluate_net = shared_net  # 共享同一份快照, 不再逐个 deepcopy
+                    agent.lstm_h = None  # 换了权重,h/c也重置
+
+        # 轻量reward循环 (ISL free_band已稳定, 确保reward与旧版一致)
+        GLOBAL_BETA = 0.1
+        ep_total = 0.0
+        for agent in u_agents:
+            local_r = agent.get_reward()
+            impact = getattr(agent, '_impact', 0.0)
+            gr = local_r + GLOBAL_BETA * impact
+            ob_re[agent][1] = gr
+            ep_total += gr
+
+        #数据记录 + 收敛检测
+        if episode < 20 or episode % 100 == 0:
+            print(f'[ep {episode}] episode_reward={episode_reward:.4f} total={total_reward:.1f}', flush=True)
+        log.logger.debug('time %d: reward = %.4f, episodes = %d',
+            time, episode_reward, episode)
+        if episode%100==99:
+            window_size = min(100, episode+1)
+            average_reward = temp_reward/window_size
+            stats_windows += 1
+            loss_val = getattr(c_agent, 'last_loss', 0.0)
+            log.logger.info('avg_reward past %d = %.4f (%.3f/u) loss=%.4f, episodes = %d, best=%.4f(%.3f/u), no_improve=%d',
+                window_size, average_reward, average_reward/len(u_agents), loss_val,
+                episode, best_avg_reward, best_avg_reward/max(1,len(u_agents)), no_improve_windows)
+
+            if episode >= min_episodes:
+                if average_reward > best_avg_reward + conv_threshold:
+                    best_avg_reward = average_reward
+                    no_improve_windows = 0
+                    log.logger.info('  -> new best reward!')
+                else:
+                    no_improve_windows += 1
+                    if no_improve_windows >= patience:
+                        converged = True
+                        log.logger.warning('  -> CONVERGED! No improvement for %d windows (%d episodes). Stopping.',
+                            patience, patience * 400)
+                        temp_reward = 0
+                        break
+            else:
+                if average_reward > best_avg_reward:
+                    best_avg_reward = average_reward
+            temp_reward = 0
+
+        reward_list.append(episode_reward)
+        time+=time_step
+        episode+=1
+        actions.clear()
+        if n_conn > 0:
+            ep_rate /= n_conn; ep_hops /= n_conn; ep_ho /= n_conn
+        # ── 新增诊断字段 ──
+        # Q值分散度: 所有agent的Q spread均值
+        q_spreads = [getattr(a, '_last_q_spread', 0.0) for a in u_agents]
+        ep_q_spread = sum(q_spreads) / len(q_spreads) if q_spreads else 0.0
+        # Q值切换差距: 切换时新旧星Q值差, 统计<0.01的比例(噪声驱动切换)
+        q_gaps = [getattr(a, '_last_q_gap', 0.0) for a in u_agents if getattr(a, '_last_q_gap', 0.0) != 0.0]
+        ep_q_gap_avg = sum(q_gaps) / len(q_gaps) if q_gaps else 0.0
+        ep_q_gap_noise = sum(1 for g in q_gaps if abs(g) < 0.01) / max(1, len(q_gaps))  # 噪声切换比例
+        # 选中卫星多样性: 200人选了几颗不同的星
+        uniq_sats = len(set(u.sat_connected.ID for u in env.topo.user if u.sat_connected is not None))
+        # 选中卫星的平均beam利用率 (总连接/总波束, 非用户加权)
+        ep_beam_avg = n_conn / max(1, uniq_sats * 64.0)
+        # 拆分reward: 正向吞吐项 vs 切换惩罚项
+        ep_rew_rate = ep_rate / RATE_UPPER  # 归一化吞吐reward (对应Cavai/C_norm)
+        ep_rew_ho = -1.5 * (1.0 - ep_ho) if n_conn > 0 else 0.0  # 切换惩罚
+        # 最新loss
+        loss_val = getattr(c_agent, 'last_loss', 0.0)
+        per_ep_log.write(f'{episode},{ep_total:.4f},{ep_rate:.0f},{ep_hops:.1f},{ep_ho:.3f},'
+                         f'{ep_q_spread:.4f},{uniq_sats},{ep_beam_avg:.3f},'
+                         f'{ep_rew_rate:.2f},{ep_rew_ho:.2f},{loss_val:.4f},'
+                         f'{ep_q_gap_avg:.4f},{ep_q_gap_noise:.3f}\n')
+        per_ep_log.flush()
+        # 每50ep存档，防中断丢失
+        if episode % 50 == 0:
+            c_agent.save_net('./log/model/%s_ep%d.pkl' % (model, episode))
+            log.logger.info('checkpoint saved: %s_ep%d.pkl' % (model, episode))
+        # TensorBoard 记录
+        if episode % 10 == 0:
+            writer.add_scalar('Reward/episode', ep_total, episode)
+            writer.add_scalar('Rate/avg', ep_rate, episode)
+            writer.add_scalar('Hops/avg', ep_hops, episode)
+            writer.add_scalar('HO/rate', ep_ho, episode)
+        # ε 衰减: Q_spread驱动 — Q值分化前保持探索, 防止羊群
+        eps_floor = float(os.environ.get('LEO_EPS_FLOOR', '0.05'))
+        ep_q_spread = sum(getattr(a, '_last_q_spread', 0.0) for a in u_agents) / len(u_agents)
+        eps_decay_eps = max(min_episodes, 200)  # 至少200ep衰减期，防止--min-episodes 0导致ε永不衰减
+        if episode < eps_decay_eps:
+            frac = episode / max(1, eps_decay_eps - 1)
+            scheduled_eps = 1.0 - frac * 0.95
+            # Q_spread过低 → Q值分不清好坏星 → 提ε防羊群
+            if ep_q_spread < 0.03 and scheduled_eps < 0.5:
+                new_eps = 0.5  # Q没学会之前不降到0.5以下
+            else:
+                new_eps = scheduled_eps
+            for agent in u_agents:
+                agent.epsilon = max(eps_floor, new_eps)
+        env.Update_Env(time,'NETWORK_LOAD')
+    log.logger.warning('from %d to %d by %d: average_reward = %.4f, episodes = %d, converged=%s',
+        start_time, time, time_step, total_reward/episode, episode, str(converged))
+    c_agent.save_net('./log/model/%s.pkl'%model)
+    writer.close()
+    env.close()
+    reward_list[0] = -1
+    reward_list[1] = -1
+    return reward_list

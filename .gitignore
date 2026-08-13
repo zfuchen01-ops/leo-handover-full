@@ -1,0 +1,12 @@
+log/
+__pycache__/
+*.pyc
+*.pkl
+*.csv
+*.pt
+*.pth
+*.bak
+*.abcd
+*.abcde
+*.b64
+nohup.out
