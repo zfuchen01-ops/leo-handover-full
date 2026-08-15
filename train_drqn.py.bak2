@@ -130,25 +130,8 @@ def main():
     _random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
     import DRQNAgent
-    import os as _os
-    # 防覆盖: 从头跑时若同 tag 输出已存在则自动换 tag; resume 时 CSV 追加续写
-    _csv_path = f'./log/RL/DRQN_{args.tag}_per_ep.csv'
-    _final_model = f'./log/model/drqn_{args.constellation}_u{args.users}_{args.tag}.pkl'
-    if args.resume:
-        _csv_mode = 'a'; _write_header = False
-    else:
-        _csv_mode = 'w'; _write_header = True
-        if _os.path.exists(_csv_path) or _os.path.exists(_final_model):
-            _n = 1
-            while _os.path.exists(f'./log/RL/DRQN_{args.tag}_r{_n}_per_ep.csv') or \
-                  _os.path.exists(f'./log/model/drqn_{args.constellation}_u{args.users}_{args.tag}_r{_n}.pkl'):
-                _n += 1
-            args.tag = f'{args.tag}_r{_n}'
-            _csv_path = f'./log/RL/DRQN_{args.tag}_per_ep.csv'
-            print(f'[warn] 同 tag 输出已存在, 自动改用 tag={args.tag} 避免覆盖历史数据', flush=True)
-    DRQNAgent.per_ep_log = open(_csv_path, _csv_mode)
-    if _write_header:
-        DRQNAgent.per_ep_log.write('episode,reward,rate_avg,hops_avg,ho_avg,q_spread,uniq_sat,beam_avg,rew_rate,rew_ho,loss,q_gap_avg,q_gap_noise,n_valid\n')
+    DRQNAgent.per_ep_log = open(f'./log/RL/DRQN_{args.tag}_per_ep.csv', 'w')
+    DRQNAgent.per_ep_log.write('episode,reward,rate_avg,hops_avg,ho_avg,q_spread,uniq_sat,beam_avg,rew_rate,rew_ho,loss,q_gap_avg,q_gap_noise,n_valid\n')
     from DRQNAgent import UserAgent, CenterAgent, train_episode
 
     # 检查 CUDA

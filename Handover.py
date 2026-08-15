@@ -290,7 +290,7 @@ class Handover:
             hold_slots = self.Get_Channel_Quality_Min_Hold_Slots()
             if hold_slots > 0 and user.sat_connected in self.ho[user]:
                 last_time = getattr(user, "_last_handover_time", None)
-                if last_time is not None and self.topo.current_time - last_time < hold_slots * 30:
+                if last_time is not None and self.topo.current_time - last_time < hold_slots * SLOT_SECONDS:
                     self.Trig_Handover(user.sat_connected,user,'NETWORK') if isNet==True else self.Trig_Handover(user.sat_connected,user,'OTHERS')
                     return
             if CHANNEL_QUALITY_MIN_SERVICE_TIME > 0 and user.sat_connected in self.ho[user]:
@@ -1097,23 +1097,26 @@ class Handover:
         VARLEN = os.environ.get('LEO_VARLEN', '0') == '1'
         K = 30 if VARLEN else 12  # 变长模式: 最多30颗可见星
 
-        features = []  # [(elev, rvt, cq, [isl_fb], sat_id), ...]
+        features = []  # [(elev, rvt, cq, [isl_fb], [is_cur], sat_id), ...]
+        cur_id = user.sat_connected.ID if user.sat_connected is not None else -1
 
         for sat in self.ho[user]:
             elev_raw = Calc_Sphere_Elevation(sat.we_pos, user.we_pos)
             elev = elev_raw * 2.0 / _pi                 # [0, 1]
             rvt  = min(1.0, self._compute_rvt(user, sat) / 600.0)
             cq   = min(1.0, self.ho[user][sat].c_quality / RATE_UPPER)
+            feat = [elev, rvt, cq]
             if FEAT >= 4:
                 fd = self._get_feeder_sat(user, sat)
                 if fd is not None and sat != fd:
                     fb = self.net.N2N_status[sat.con_id - 1][sat.ID - 1][fd.ID - 1].free_band
-                    isl_fb = min(1.0, fb / RATE_UPPER)
+                    feat.append(min(1.0, fb / RATE_UPPER))
                 else:
-                    isl_fb = 1.0  # 直连feeder, 无ISL瓶颈
-                features.append((elev, rvt, cq, isl_fb, sat.ID))
-            else:
-                features.append((elev, rvt, cq, sat.ID))
+                    feat.append(1.0)  # 直连feeder, 无ISL瓶颈
+            if FEAT >= 5:
+                feat.append(1.0 if sat.ID == cur_id else 0.0)
+            feat.append(sat.ID)
+            features.append(tuple(feat))
 
         # 按卫星ID排序 (不泄露质量信息, 网络需要自己学)
         features.sort(key=lambda x: x[-1])

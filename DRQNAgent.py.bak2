@@ -266,7 +266,7 @@ class TransformerQ_net(nn.Module):
         # Transformer: 自注意力跨卫星
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size, nhead=nhead, dim_feedforward=hidden_size * 4,
-            dropout=0.05, activation='relu', batch_first=True, norm_first=True)
+            dropout=0.05, activation='relu', batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
 
         # Per-agent heads
@@ -277,16 +277,11 @@ class TransformerQ_net(nn.Module):
             for _ in range(num_agents)
         ])
         self.cross_heads = nn.ModuleList([nn.Linear(hidden_size, 16) for _ in range(num_agents)])
-        # GTrXL-P0: 门控残差, cross-sat 分支近零 init + 近闭 gate (sigmoid(-0.85)≈0.30)
-        for m in self.cross_heads:
-            nn.init.normal_(m.weight, std=1e-3)
-            nn.init.zeros_(m.bias)
-        self.gate = nn.Parameter(torch.tensor(-0.85))
         self.v_heads = nn.ModuleList([nn.Linear(16, 1) for _ in range(num_agents)])
         self.a_heads = nn.ModuleList([nn.Linear(16 + 16, 1) for _ in range(num_agents)])
         self._head_idx = 0
-        # GTrXL-P0: 逐卫星 token 的共享时序 GRU (开关 LEO_TF_TEMPORAL, 默认开)
-        self.temporal = os.environ.get('LEO_TF_TEMPORAL', '1') == '1'
+        # A1: 可选时序记忆, GRU 跨 seq 累积 context (开关 LEO_TF_TEMPORAL=1)
+        self.temporal = os.environ.get('LEO_TF_TEMPORAL', '0') == '1'
         if self.temporal:
             self.temporal_gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
 
@@ -298,7 +293,6 @@ class TransformerQ_net(nn.Module):
         B, seq_len, _ = input.shape
         F = self.feat_per_sat
         H = self.hidden_size
-        gate_s = torch.sigmoid(self.gate)   # GTrXL-P0 门控残差
         # 变长模式: 从实际输入推导K (input=[B,seq,K*F], embed由网络生成)
         if self.varlen:
             K = input.shape[2] // F
@@ -330,20 +324,16 @@ class TransformerQ_net(nn.Module):
         # 卫星位置编码 (变长时取前K个位置)
         sat_h = sat_h + self.sat_pos[:, :, :K, :]
 
-        # GTrXL-P0: 逐卫星 token 的共享时序编码 (跨星 attention 之前)
-        if self.temporal:
-            sat_h_t = sat_h.permute(0, 2, 1, 3).reshape(B * K, seq_len, H)  # [B*K, seq, H]
-            sat_h_t, _ = self.temporal_gru(sat_h_t)
-            sat_h = sat_h_t.reshape(B, K, seq_len, H).permute(0, 2, 1, 3)   # [B, seq, K, H]
-
         # Flatten: [B*seq, K, H] → Transformer跨卫星attention
-        tokens = sat_h.reshape(B * seq_len, K, H)
+        tokens = sat_h.view(B * seq_len, K, H)
         out = self.transformer(tokens, src_key_padding_mask=pad_mask)  # [B*seq, K, H]
         out = out.view(B, seq_len, K, H)
 
         # Context: mean-pool有效卫星的Transformer输出
         valid = (~pad_mask_3d).float().unsqueeze(-1)  # [B, seq, K, 1]
         ctx_h = (out * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)  # [B, seq, H]
+        if self.temporal:
+            ctx_h, _ = self.temporal_gru(ctx_h)  # 时序记忆
 
         # Per-agent ctx + per-sat features
         ctx = torch.zeros(B, seq_len, 16, device=input.device)
@@ -365,12 +355,12 @@ class TransformerQ_net(nn.Module):
                     ns, sq = sat_tokens[m].shape[0], sat_tokens[m].shape[1]
                     raw_feat = self.sat_nets[idx](sat_tokens[m].reshape(ns * sq * K, F)).reshape(ns, sq, K, 16)
                     cross_feat = self.cross_heads[idx](out[m])  # [n, seq, K, H] → [n, seq, K, 16]
-                    sat_feat[m] = raw_feat + gate_s * cross_feat
+                    sat_feat[m] = raw_feat + cross_feat
         else:
             flat_raw = sat_tokens.reshape(B * seq_len * K, F)
             raw_feat = self.sat_nets[self._head_idx](flat_raw).reshape(B, seq_len, K, 16)
             cross_feat = self.cross_heads[self._head_idx](out)  # [B, seq, K, H] → [B, seq, K, 16]
-            sat_feat = raw_feat + gate_s * cross_feat
+            sat_feat = raw_feat + cross_feat
 
         # Dueling: V(ctx) + A(sat, ctx) → Q
         V = torch.zeros(B, seq_len, 1, device=input.device)
@@ -447,17 +437,11 @@ class LSTMAttnQ_net(nn.Module):
                                                      nn.Linear(32, 16), nn.ReLU())
                                        for _ in range(num_agents)])
         self.cross_heads = nn.ModuleList([nn.Linear(hidden_size, 16) for _ in range(num_agents)])
-        for m in self.cross_heads:                 # 近零 init，初始模型≈纯 LSTM
-            nn.init.normal_(m.weight, std=1e-3)
-            nn.init.zeros_(m.bias)
-        self.gate = nn.Parameter(torch.tensor(-0.85))   # sigmoid(-0.85)≈0.30，梯度健康
-        self.use_gate = os.environ.get('LEO_ATTN_GATE', '0') == '1'
         self.v_heads = nn.ModuleList([nn.Linear(16, 1) for _ in range(num_agents)])
         self.a_heads = nn.ModuleList([nn.Linear(16 + 16, 1) for _ in range(num_agents)])
         self._head_idx = 0
 
     def forward(self, input, h, c, head_indices=None):
-        gate = torch.sigmoid(self.gate) if self.use_gate else 1.0
         B, seq_len = input.shape[0], input.shape[1]
         K = self.top_k
         F = self.feat_per_sat
@@ -491,7 +475,7 @@ class LSTMAttnQ_net(nn.Module):
         per_sat = input[:, :, :K * F].reshape(B, seq_len, K, F)  # [B, seq, K, F]
         pad = (per_sat.abs().sum(dim=-1) < 1e-8)                 # [B, seq, K] True=padding
         sat_h = self.sat_proj(per_sat)
-        tokens = sat_h.reshape(B * seq_len, K, H)
+        tokens = sat_h.view(B * seq_len, K, H)
         out = self.transformer(tokens, src_key_padding_mask=pad.view(B * seq_len, K))
         out = out.view(B, seq_len, K, H)
 
@@ -503,11 +487,11 @@ class LSTMAttnQ_net(nn.Module):
                     ns, sq = per_sat[m].shape[0], per_sat[m].shape[1]
                     raw_feat = self.sat_nets[idx](per_sat[m].reshape(ns * sq * K, F)).reshape(ns, sq, K, 16)
                     cross_feat = self.cross_heads[idx](out[m])
-                    sat_feat[m] = raw_feat + gate * cross_feat
+                    sat_feat[m] = raw_feat + cross_feat
         else:
             raw_feat = self.sat_nets[self._head_idx](per_sat.reshape(B * seq_len * K, F)).reshape(B, seq_len, K, 16)
             cross_feat = self.cross_heads[self._head_idx](out)
-            sat_feat = raw_feat + gate * cross_feat
+            sat_feat = raw_feat + cross_feat
 
         ctx_exp = ctx.unsqueeze(2).expand(-1, -1, K, -1)
         combined = torch.cat([sat_feat, ctx_exp], dim=-1)
@@ -573,7 +557,6 @@ class UserAgent:
         K = self.action_n
         sat_ids = getattr(self.user, '_topK_sat_ids', [0]*K)
         n_valid = sum(1 for sid in sat_ids if sid > 0)  # 有效卫星数
-        self._last_n_valid = n_valid  # 供CSV诊断列
 
         # 最小保持时间: 如果当前星在top-K中, 保持其索引
         MIN_HOLD_SLOTS = 2
@@ -676,19 +659,8 @@ class CenterAgent:
             self.evaluate_net = TransformerQ_net(state_dim + 64, K, hidden_size, num_agents=n_agents, top_k=K).to(self.device)
             print("  [CenterAgent] 使用 TransformerQ_net", flush=True)
         else:
-            self.evaluate_net = Q_net(state_dim + 64, K, hidden_size, num_agents=n_agents, top_k=K).to(self.device)
-        # ── 手段A: 冻结 raw 路径 (LEO_FREEZE_RAW=1 + LEO_RAW_CKPT), 只训 attention 分支 ──
-        if os.environ.get('LEO_FREEZE_RAW', '0') == '1':
-            raw_ckpt = os.environ.get('LEO_RAW_CKPT', '')
-            ck = torch.load(raw_ckpt, map_location='cpu', weights_only=False)
-            raw_state = ck['evaluate_net'] if 'evaluate_net' in ck else ck
-            self.evaluate_net.load_state_dict(raw_state, strict=False)
-            _freeze_prefix = ('agent_embed', 'lstm', 'ctx_fcs', 'sat_nets', 'v_heads', 'a_heads')
-            for _n, _p in self.evaluate_net.named_parameters():
-                if _n.startswith(_freeze_prefix):
-                    _p.requires_grad = False
-            print('  [CenterAgent] freeze-raw 加载 %s' % raw_ckpt, flush=True)
-        self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.evaluate_net.parameters()), lr=lr)
+            self.evaluate_net = Q_net(state_dim + 64, K, hidden_size, top_k=K).to(self.device)
+        self.optimizer = optim.Adam(self.evaluate_net.parameters(), lr=lr)
         self.loss = nn.SmoothL1Loss()
 
         self.env = env
@@ -1082,11 +1054,10 @@ def train_episode(env:Handover, u_agents, c_agent, model, mode=None,start_time=0
         ep_rew_ho = -1.5 * (1.0 - ep_ho) if n_conn > 0 else 0.0  # 切换惩罚
         # 最新loss
         loss_val = getattr(c_agent, 'last_loss', 0.0)
-        ep_n_valid = sum(getattr(a, '_last_n_valid', 0) for a in u_agents) / len(u_agents)
         per_ep_log.write(f'{episode},{ep_total:.4f},{ep_rate:.0f},{ep_hops:.1f},{ep_ho:.3f},'
                          f'{ep_q_spread:.4f},{uniq_sats},{ep_beam_avg:.3f},'
                          f'{ep_rew_rate:.2f},{ep_rew_ho:.2f},{loss_val:.4f},'
-                         f'{ep_q_gap_avg:.4f},{ep_q_gap_noise:.3f},{ep_n_valid:.1f}\n')
+                         f'{ep_q_gap_avg:.4f},{ep_q_gap_noise:.3f}\n')
         per_ep_log.flush()
         # 每50ep存档，防中断丢失
         if episode % 50 == 0:

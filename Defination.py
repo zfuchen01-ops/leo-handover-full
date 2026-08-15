@@ -52,6 +52,10 @@ DIRECT_PATH_QUALITY = float(os.environ.get(
     "LEO_DIRECT_PATH_QUALITY",
     1.1 if CAHS_VARIANT == "calibrated" else 2.0,
 ))
+# 时隙(仿真时间步)物理时长(秒): 论文/启发式基线(demand_trace/run_experiments)与
+# DRQN 训练(train_drqn/DRQNAgent)必须同一口径, 统一为 30 秒(此前 DRQN 误用 50 秒
+# 导致与论文基线不可比)。 需其它口径设环境变量 LEO_SLOT_SECONDS。
+SLOT_SECONDS = int(os.environ.get("LEO_SLOT_SECONDS", "30"))
 AGC_PREDICT_WINDOW = int(os.environ.get("LEO_AGC_PREDICT_WINDOW", 30))
 LIGHT_LOAD_USER_THRESHOLD = int(os.environ.get(
     "LEO_LIGHT_LOAD_USER_THRESHOLD",

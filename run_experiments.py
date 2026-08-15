@@ -32,6 +32,7 @@ for log_dir in [
     (BASE_DIR / log_dir).mkdir(parents=True, exist_ok=True)
 
 from Defination import (
+    SLOT_SECONDS,
     AGC_PREDICT_WINDOW,
     BANDWIDTH,
     CAHS_VARIANT,
@@ -254,7 +255,7 @@ def run_one(user_count: int, constellation: str, method: str, slots: int, seed: 
     random.seed(seed)
     np.random.seed(seed)
     env = build_env(user_count, constellation, traffic_mode, gateway_count)
-    env.Run_Network_Handover(0, slots * 30, 30, METHODS[method])
+    env.Run_Network_Handover(0, slots * SLOT_SECONDS, SLOT_SECONDS, METHODS[method])
     return summarize(env, user_count, method)
 
 

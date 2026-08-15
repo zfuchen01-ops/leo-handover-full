@@ -187,7 +187,7 @@ class Network:
                         if not hasattr(lsa, '_orig_total_band'):
                             lsa._orig_total_band = lsa.total_band
 
-    def apply_isl_failures(self, current_time, delta_T=50):
+    def apply_isl_failures(self, current_time, delta_T=SLOT_SECONDS):
         """Weibull故障模型 (对齐杨): 断链和恢复都由同一Weibull公式驱动
         S(τ)=exp(-(τ/η)^β)
         正常链路: P(fail)=1-S(τ+∆T)/S(τ) = 在∆T内不断的条件概率

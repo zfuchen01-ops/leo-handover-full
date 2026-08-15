@@ -14,6 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("LEO_QUIET_LOGS", "1")
 
 from Handover import Handover
+from Defination import SLOT_SECONDS
 from Position import Calc_Sphere_Distance, Calc_Sphere_Elevation
 from run_experiments import METHODS, build_env, ensure_log_dirs
 
@@ -239,7 +240,7 @@ def run_user_trace(job: tuple[argparse.Namespace, int]) -> tuple[list[dict[str, 
     rows_for_user = []
     env.Network_Handover(0, METHODS[args.method])
     rows_for_user.append(collect_slot(env, users, 1, None, args.path_stats))
-    for slot_index, t in enumerate(range(30, args.slots * 30, 30), start=2):
+    for slot_index, t in enumerate(range(SLOT_SECONDS, args.slots * SLOT_SECONDS, SLOT_SECONDS), start=2):
         env.Network_Handover(t, METHODS[args.method])
         row = collect_slot(env, users, slot_index, None, args.path_stats)
         rows_for_user.append(row)
@@ -319,7 +320,7 @@ def run_trace(args: argparse.Namespace) -> tuple[list[dict[str, float | int]], l
                 )
                 rows_for_user.append(row)
                 slot_rows.append(row)
-                for slot_index, t in enumerate(range(30, args.slots * 30, 30), start=2):
+                for slot_index, t in enumerate(range(SLOT_SECONDS, args.slots * SLOT_SECONDS, SLOT_SECONDS), start=2):
                     env.Network_Handover(t, METHODS[args.method])
                     row = collect_slot(
                         env,
